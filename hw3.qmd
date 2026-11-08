@@ -1,0 +1,291 @@
+---
+title: "Homework Assignment 3: Oyster Restoration in EEZ"
+author: Aaron Wang
+date: 11-3-2026
+format:
+    pdf:
+        code-fold: false
+
+execute: 
+    message: false
+    warning: false
+---
+```{r}
+library(tidyverse)
+library(tmap)
+library(sf)
+library(terra)
+library(knitr)
+library(kableExtra)
+
+sst_2008 <- rast("data/average_annual_sst_2008.tif")
+sst_2009 <- rast("data/average_annual_sst_2009.tif")
+sst_2010 <- rast("data/average_annual_sst_2010.tif")
+sst_2011 <- rast("data/average_annual_sst_2011.tif")
+sst_2012 <- rast("data/average_annual_sst_2012.tif")
+
+depth <- rast("data/depth.tif")
+
+eez <- st_read("data/wc_regions_clean.shp")
+```
+
+## Check coordinate reference system
+```{r}
+if (crs(sst_2008) == crs(depth)) {
+    print('crs match')
+} else {
+    warning('crs does not match')
+}
+```
+
+```{r}
+if (crs(sst_2008) == crs(eez)) {
+    print('crs match')
+} else {
+    warning('crs does not match')
+}
+```
+
+```{r}
+# match eez dataframe to sst raster
+eez <- st_set_crs(eez, 4326)
+
+```
+
+## Process data:
+Next, we need to process the SST and depth data so that they can be combined. In this case the SST and depth data have slightly different resolutions, extents, and positions.
+
+* find the mean SST from 2008-2012 (e.g. create single raster of average SST) 
+* convert average SST from Kelvin to Celsius 
+    - hint: subtract by 273.15
+* crop depth raster to match the extent of the SST raster
+* note: the resolutions of the SST and depth data do not match
+    - resample the depth data to match the resolution of the SST data using the bilinear method approach
+* check that the depth and SST match in resolution, extent, and coordinate reference system
+    - hint: can the rasters be stacked?
+
+```{r}
+# stack the sst rasters and obtain the average sst from 2008-2012
+# do not use merge() because it combines rasters spatially joining by the geographic covers
+sst <- c(sst_2008, sst_2009, sst_2010, sst_2011, sst_2012)
+sst_avg_K <- mean(sst, na.rm = TRUE)
+
+# sst_avg_K <- global(sst, 'mean', na.rm = TRUE)
+## cannot use global() because it converts the raster into a dataframe
+
+# convert sst unit from Kelvin to Celsius
+sst_avg_C <- sst_avg_K - 273.15
+```
+
+### Match extent
+```{r}
+# crop depth raster to match the extent of the sst raster 
+depth_cropped <- crop(depth, sst_avg_C)
+```
+
+### Match resolution 
+```{r}
+# resample depth raster to match the sst raster's resolution
+depth_cropped <- resample(x = depth_cropped, y = sst_avg_C, method = 'bilinear')
+```
+
+### Stack depth and sst
+```{r}
+# depth and SST have matching resolution, extent, and coordinate reference system
+combined_rast <- c(depth_cropped, sst_avg_C)
+```
+
+## Find suitable locations:
+
+To find suitable locations for marine aquaculture, we’ll need to find locations that are suitable in terms of both SST and depth.
+
+* reclassify SST and depth data into locations that are suitable for oysters
+    - hint: set suitable values to 1 and unsuitable values to 0
+* find locations that satisfy both SST and depth conditions
+
+```{r}
+# Table of conditions for Maximum Osyter Growth
+criteria <- tibble(
+  Variable = c("Sea Surface Temperature", "Ocean Depth"),
+  Suitable_Range = c("11–30°C", "0–70 m below sea level")
+)
+
+criteria |>
+  kbl(
+    caption = "Environmental Criteria for Oyster Suitability",
+    col.names = c("Variable", "Suitable Range"),
+    align = "c"
+  ) |>
+  kable_styling(
+    latex_options = "striped",
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+```{r}
+# reclassifying sst 
+rcl_sst <- matrix(c(10, 30, 1),
+                  ncol = 3,
+                  byrow = TRUE)
+reclassified_sst <- classify(combined_rast$mean, 
+                             rcl = rcl_sst,
+                             others = 0)
+
+
+# reclassifying depth 
+rcl_depth <- matrix(c(-71, 0, 1),
+                    ncol = 3, 
+                    byrow = TRUE)
+reclassified_depth <- classify(combined_rast$depth, 
+                               rcl = rcl_depth,
+                               others = 0)
+
+
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 7
+#| out-width: "100%"
+#| fig-align: center
+
+# combine reclassified values 
+reclassified <- c(reclassified_sst, reclassified_depth)
+
+
+# function for multiplying each rows' mean and depth to determine suitability
+suitability <- function(mean, depth) {
+    mean * depth
+}
+
+# use lapp function to multiply values in reclassified raster using 'suitability' function
+suit_conditions <- lapp(reclassified, fun = suitability)
+suit_conditions[depth_cropped >= 0] <- NA
+
+tm_shape(suit_conditions) +
+    tm_raster(col.scale = tm_scale_categorical(values = c('lightblue', 'navyblue'),
+                                               labels = c('unsuitable', 'suitable')),
+              col.legend = tm_legend(title = 'Oyster Suitability')
+    ) +
+tm_title(text = 'Area Suitability for Optimal Oyster Growth') +
+tm_compass(position = c('bottom', 'left')) +
+tm_scalebar(position = c('bottom', 'right'), size = 0.6)
+```
+
+### Reflections/Intepretations
+The map above reflects the suitable areas for oyster growth in the west coast. The dark blue colors indicating that these regions along the coast meet the conditions required for optimal oyster growth. The light blue colors indicates that these regions in the ocean are not fit for oyster growth. From our map, we can see that oysters tend to have the most optimal growth along the coast rather than open ocean due to shallower depths and moderate temperatures. There is a slightly larger area more north along the west coast of the U.S. 
+
+## Determine the most suitable EEZ
+We want to determine the total suitable area within each EEZ in order to rank zones by priority. To do so, we need to find the total area of suitable locations within each EEZ.
+
+* select suitable cells within West Coast EEZs
+* find area of grid cells
+* find the total suitable area within each EEZ
+    - hint: it might be helpful to rasterize the EEZ data
+
+```{r}
+# change the extent of the suitable area to match the EEZ extent
+west_coast <- mask(suit_conditions, eez)
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 7
+#| out-width: "100%"
+#| fig-align: center
+
+# visualize the oyster suitability within each Exclusive Economic Zone 
+tm_shape(west_coast) +
+    tm_raster(col.scale = tm_scale_categorical(values = c("lightblue", "navyblue"), labels = c('0 (unsuitable)', '1 (suitable)')),
+    col.legend = tm_legend(title = 'Oyster Suitability')) +
+tm_shape(eez) +
+    tm_borders(col = 'black') +
+tm_title(text = 'Suitability Range within Exclusive Economic Zones') +
+tm_compass(position = c('bottom', 'left')) +
+tm_scalebar(position = c('bottom', 'right'), size = 0.6) + 
+tm_layout(inner.margins = c(0.12, 0.05, 0.05, 0.25))
+
+```
+
+### Reflections/Intepretations
+In figure 2 we condensed the suitability range of the oyster from the previous question down to the extent of the EEZ that is separated into five different zones. The top zone appears to have the most about of area suitable for oyster growth while the bottom zone has the least suitable area for oyster growth. 
+
+```{r}
+# calculating the total area of the grid cells in west coast EEZ
+total_grid_area <- cellSize(west_coast, unit = 'km')
+```
+
+```{r}
+# rasterize the eez dataframe 
+# The second argument (west_coast) is a template raster: the new raster copies its extent, resolution, and CRS, so the two line up cell for cell.
+eez_rast <- rasterize(eez, west_coast, field = 1:nrow(eez))
+
+
+# multiplies the suitable areas (1) with the grid area
+suit_area <- west_coast * total_grid_area
+
+# calculate the total suitable area in each EEZ
+zones <- zonal(suit_area, eez_rast, fun = 'sum', na.rm = TRUE)
+
+
+# create a formatted table that shows the rank of EEZs by total suitable area
+zones <- zones |>
+    mutate(layer = c('A', 'B', 'C', 'D', 'E')) |>
+    arrange(desc(lyr1)) |>
+    mutate(rank = row_number())
+
+zones |>
+    kbl(
+        caption = "Suitable Oyster Habitat Area by Exclusive Economic Zone",
+        col.names = c("EEZ Zone", "Suitable Area (km²)", "Rank"),
+        digits = 2,
+        align = "c"
+    ) |> 
+    kable_styling(
+        latex_options = c("striped", "hold_position"),
+        full_width = FALSE,
+        position = "center"
+    )
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 7
+#| out-width: "100%"
+#| fig-align: center
+
+# ranking each zone within the EEZ by best area for oyster growth
+rcl_rank <- matrix(c(5, 1,
+                     3, 2,
+                     1, 3,
+                     4, 4,
+                     2, 5),
+                   ncol = 2, byrow = TRUE)
+
+rank_rast <- classify(eez_rast, rcl = rcl_rank)
+eez$zone <- c("A", "B", "C", "D", "E")
+
+tm_shape(rank_rast) +
+  tm_raster(col.scale = tm_scale_categorical(values = "-blues"),
+            col.legend = tm_legend(title = "Suitability rank\n(1 = most area)")) +
+tm_shape(eez) +
+  tm_borders(col = 'black') +
+  tm_text('zone')
+tm_title(text = 'EEZ Oyster Suitability Ranking') +
+tm_compass(position = c('bottom', 'left')) +
+tm_scalebar(position = c('bottom', 'right'), size = 0.6) +
+tm_layout(inner.margins = c(0.12, 0.05, 0.05, 0.25))
+
+```
+
+### Reflections/Intepretations
+This graph ranks each of the zones by how much more suitable area the zone contains for oysters. The darker blue represents higher priority for marine aquaculture while the lighter shades indicates lower priority. Our initial observation for the lowest area coverage was inaccurate as from the graph we can see that the middle zone had the lowest with a total area of 2849.3 km. However our observation for the top zone was accurate as it had the highest suitability area coverage with a total area of 6403.088 km. 
+
+## Data Citation
+
+| Data | Citation | Link |
+|:---|:---|:---|
+| Sea Surface Temperature 2008-2012 | NOAA Coral Reef Watch. (2018, updated daily). *NOAA Coral Reef Watch Version 3.1 Daily Global 5km Satellite Sea Surface Temperature Anomaly Product*. College Park, Maryland, USA: NOAA Coral Reef Watch. | [NOAA Coral Reef Watch](https://coralreefwatch.noaa.gov/product/5km/index_5km_ssta.php) |
+| Bathymetry | GEBCO Bathymetric Compilation Group 2026. (2026). *The GEBCO_2026 Grid – a continuous terrain model for oceans and land at 15 arc-second intervals*. | [GEBCO Bathymetry](https://www.gebco.net/data-products/gridded-bathymetry-data#area) |
+| Exclusive Economic Zones | Flanders Marine Institute. (2023). *Maritime Boundaries Geodatabase: Maritime Boundaries and Exclusive Economic Zones (200NM), version 12*. | [Marine Regions](https://www.marineregions.org/eez.php) |
